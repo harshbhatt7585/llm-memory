@@ -187,8 +187,12 @@ def process_question(
 
         context = f"Question: {question}\n\nConversation:\n{format_session(chunk)}"
         response = query_model(context, SYSTEM_PROMPT)
-        if verbose:
-            print(f"[chunk {chunk_idx}] {response}")
+
+        print(f"--------------------------------")
+        print(f"Question: {question}")
+        print(f"Conversation: {chunk}")
+        print(f"[chunk {chunk_idx}] {response}")
+        print(f"--------------------------------")
         parsed = parse_agent_response(response)
 
         chunk_logs.append(
@@ -249,6 +253,53 @@ def main() -> None:
     found_count = sum(1 for r in results if r["answer"])
     print(f"\nSaved {len(results)} answers to {args.output}")
     print(f"Found answers: {found_count}/{len(results)}, Total chunks examined: {total_chunks}")
+
+
+
+def search_agent(question: str, model, trials=20) -> str:
+    """This agent will search the conversation in the vector db, it will create query for vector db"""
+
+
+    messages = [
+        {"role": "system", 
+        "content": """You are a search agent who will make query for vector db to search the conversation, iterate over different queries to find the answer"""
+        },
+        {
+            "role": "user", 
+            "content": f"Generate a query for vector db to search the conversation for the question: {question}"
+        }
+    ]
+    for i in range(trials):
+
+
+        inputs = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(model_device)
+
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
+            pad_token_id=tokenizer.eos_token_id,
+            use_cache=True,
+            temperature=0.1,
+            top_p=0.95,
+            top_k=40,
+        )
+
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        
+        results = search_vector_db(response)
+        
+
+
+
+        
+
+     
 
 
 if __name__ == "__main__":
