@@ -1,29 +1,18 @@
 from __future__ import annotations
 
-import hashlib
+import argparse
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
-import numpy as np
 import torch
-from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
-import faiss
 from tqdm import tqdm
-
-# Fix FAISS segfault on macOS by disabling OpenMP parallelism
-faiss.omp_set_num_threads(1)
 
 
 DATASET_PATH = Path("dataset.json")
 MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
-EMBED_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
-EMBED_CACHE_PATH = Path("chunk_embeddings.pt")
-FAISS_INDEX_PATH = Path("conversation.index")
-FAISS_METADATA_PATH = Path("conversation_metadata.json")
-RETRIEVAL_TOP_K = 5
 MAX_NEW_TOKENS = 64  # JSON response is short, no need for 128
 
 
@@ -32,12 +21,29 @@ def load_dataset(path: Path) -> List[Dict]:
         return json.load(fh)
 
 
-def compute_file_hash(path: Path) -> str:
-    hasher = hashlib.sha1()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(8192), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Simple memory agent for conversation deep search")
+    parser.add_argument("--dataset", type=Path, default=DATASET_PATH, help="Dataset JSON file")
+    parser.add_argument("--output", type=Path, default=Path("results.json"), help="Path to save agent answers")
+    parser.add_argument("--start", type=int, default=0, help="Question index to start from")
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=1,
+        help="How many questions to process (<=0 means process all remaining)",
+    )
+    parser.add_argument(
+        "--max-chunks",
+        type=int,
+        default=None,
+        help="Limit how many conversation chunks are inspected per question",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print model responses for each chunk while processing",
+    )
+    return parser.parse_args()
 
 
 def format_session(session: List[Dict[str, str]]) -> str:
@@ -94,66 +100,6 @@ def parse_agent_response(raw: str) -> Dict:
         except (ValueError, json.JSONDecodeError):
             return {"found": False, "answer": raw.strip()}
 
-
-class SemanticRetriever:
-    def __init__(
-        self,
-        dataset: List[Dict],
-        dataset_hash: str,
-        model_name: str = EMBED_MODEL_ID,
-        cache_path: Path = EMBED_CACHE_PATH,
-    ) -> None:
-        self.dataset = dataset
-        self.dataset_hash = dataset_hash
-        self.model_name = model_name
-        self.cache_path = cache_path
-        self.embed_device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.embed_torch_device = torch.device(self.embed_device)
-        self.embedder = SentenceTransformer(self.model_name, device=self.embed_device)
-        self.index = faiss.read_index(str(FAISS_INDEX_PATH))
-        self.metadata = self._load_metadata()
-        self.chunk_lookup = {entry["chunk_id"]: entry for entry in self.metadata}
-
-    def _load_metadata(self) -> List[Dict]:
-        with FAISS_METADATA_PATH.open("r") as fh:
-            payload = json.load(fh)
-        stored_hash = payload.get("dataset_hash")
-        if stored_hash != self.dataset_hash:
-            raise RuntimeError(
-                "Metadata hash mismatch. Regenerate the FAISS index via prepare_dataset.py"
-            )
-        chunks = payload.get("chunks", [])
-        chunks.sort(key=lambda item: item["chunk_id"])  # keep aligned with FAISS ids
-        return chunks
-
-    def retrieve(self, question_idx: int, question: str, top_k: int) -> List[Tuple[int, float]]:
-        query_embedding = self.embedder.encode(
-            [question],
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
-        if query_embedding.ndim == 1:
-            query_embedding = np.expand_dims(query_embedding, axis=0)
-
-        search_k = min(max(top_k * 5, top_k), self.index.ntotal)
-        scores, indices = self.index.search(query_embedding, search_k)
-
-        filtered: List[Tuple[int, float]] = []
-        for chunk_id, score in zip(indices[0], scores[0]):
-            if chunk_id == -1:
-                continue
-            meta = self.chunk_lookup.get(int(chunk_id))
-            if not meta or meta["question_idx"] != question_idx:
-                continue
-            filtered.append((meta["chunk_idx"], float(score)))
-            if len(filtered) == top_k:
-                break
-        return filtered
-
-
-dataset = load_dataset(DATASET_PATH)
-dataset_hash = compute_file_hash(DATASET_PATH)
 
 def resolve_model_device() -> torch.device:
     requested = os.environ.get("LLM_DEVICE")
@@ -213,11 +159,13 @@ Answer: {"found": false, "answer": ""}
 def process_question(
     question_idx: int,
     item: Dict,
-    retriever: SemanticRetriever,
+    *,
+    max_chunks: int | None = None,
+    verbose: bool = False,
 ) -> Dict:
-    """Process a single question and return the result dict."""
-    question = item["question"]
-    sessions = item["session"]
+    """Process a question by scanning the conversation chunks sequentially."""
+    question = item.get("question", "")
+    sessions = item.get("session", [])
 
     if not sessions:
         return {
@@ -229,66 +177,77 @@ def process_question(
             "chunk_logs": [],
         }
 
-    retrieved = retriever.retrieve(question_idx, question, RETRIEVAL_TOP_K)
-    score_lookup = dict(retrieved)
-    chunk_order = [idx for idx, _ in retrieved]
-
-    if not chunk_order:
-        chunk_order = list(range(min(RETRIEVAL_TOP_K, len(sessions))))
-
+    limit = None if max_chunks is None or max_chunks <= 0 else max_chunks
     chunk_logs = []
     final_answer = ""
 
-    for chunk_idx in chunk_order:
-        context = f"Question: {question}\n\nConversation:\n{format_session(sessions[chunk_idx])}"
+    for chunk_idx, chunk in enumerate(sessions):
+        if limit is not None and chunk_idx >= limit:
+            break
+
+        context = f"Question: {question}\n\nConversation:\n{format_session(chunk)}"
         response = query_model(context, SYSTEM_PROMPT)
-        print(response)
+        if verbose:
+            print(f"[chunk {chunk_idx}] {response}")
         parsed = parse_agent_response(response)
-        
-        chunk_logs.append({
-            "chunk_index": chunk_idx,
-            "similarity": score_lookup.get(chunk_idx),
-            "response": response,
-            "parsed": parsed,
-        })
-        
+
+        chunk_logs.append(
+            {
+                "chunk_index": chunk_idx,
+                "response": response,
+                "parsed": parsed,
+            }
+        )
+
         if parsed.get("found"):
             final_answer = parsed.get("answer", "")
             break
     else:
-        # No answer found in any chunk
         if chunk_logs:
             final_answer = chunk_logs[-1]["parsed"].get("answer", "")
 
+    retrieved_chunks = [entry["chunk_index"] for entry in chunk_logs]
     return {
         "question": question,
         "answer": final_answer,
         "chunks_examined": len(chunk_logs),
         "chunks_total": len(sessions),
-        "retrieved_chunks": chunk_order,
+        "retrieved_chunks": retrieved_chunks,
         "chunk_logs": chunk_logs,
     }
 
 
-def main():
-    print(f"Processing {len(dataset)} questions...")
-    retriever = SemanticRetriever(dataset, dataset_hash)
-    
+def main() -> None:
+    args = parse_args()
+    dataset = load_dataset(args.dataset)
+    if not dataset:
+        raise RuntimeError("Dataset is empty. Nothing to evaluate.")
+
+    if args.start < 0 or args.start >= len(dataset):
+        raise ValueError(f"Start index {args.start} is outside the dataset range (size={len(dataset)})")
+
+    remaining = len(dataset) - args.start
+    count = remaining if args.count <= 0 else min(args.count, remaining)
+    subset = dataset[args.start : args.start + count]
+
+    print(f"Processing {len(subset)} questions starting at index {args.start}...")
+    iterator = enumerate(subset, start=args.start)
     results = []
-    for question_idx, item in enumerate(tqdm(dataset, desc="Questions")):
-        if question_idx != 0:
-            break
-        result = process_question(question_idx, item, retriever)
+    for question_idx, item in tqdm(iterator, total=len(subset), desc="Questions"):
+        result = process_question(
+            question_idx,
+            item,
+            max_chunks=args.max_chunks,
+            verbose=args.verbose,
+        )
         results.append(result)
-    
-    output_path = Path("results.json")
-    with output_path.open("w") as fh:
+
+    with args.output.open("w") as fh:
         json.dump(results, fh, indent=2)
-    
-    # Summary stats
+
     total_chunks = sum(r["chunks_examined"] for r in results)
     found_count = sum(1 for r in results if r["answer"])
-    print(f"\nSaved {len(results)} answers to {output_path}")
+    print(f"\nSaved {len(results)} answers to {args.output}")
     print(f"Found answers: {found_count}/{len(results)}, Total chunks examined: {total_chunks}")
 
 
