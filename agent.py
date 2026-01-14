@@ -16,7 +16,7 @@ def load_dataset(path: str | Path) -> List[Dict]:
 dataset = load_dataset("dataset.json")
 
 
-model_id = "Qwen/Qwen2.5-0.5B-Instruct"
+model_id = "meta-llama/Llama-3.2-1B-Instruct"
 device = (
     torch.device("cuda") if torch.cuda.is_available() else
     torch.device("mps") if torch.backends.mps.is_available() else
@@ -41,8 +41,9 @@ tokenizer = AutoTokenizer.from_pretrained(model_id)
 
 SYSTEM_PROMPT = (
     "You are memory agent, who goes through all the conversation to find the relevant answer. "
-    "If the conversation contains the answer, respond with `Answer: <the answer>`. "
-    "If you cannot find it, respond with `Answer: I don't know`."
+    "If the conversation contains the answer, respond with the answrr."
+    "If you cannot find the answer in the conversation, respond with 'I don't know'."
+    "Only Response in JSON format: {'answer': 'the answer'}"
 )
 
 
@@ -63,19 +64,32 @@ def query_model(context_text: str) -> str:
         },
     ]
 
-    inputs = tokenizer.apply_chat_template(
-        conversation,
-        add_generation_prompt=True,
-        tokenize=True,
-        return_dict=True,
-        return_tensors="pt",
-    ).to(device)
+    if tokenizer.chat_template is not None:
+        inputs = tokenizer.apply_chat_template(
+            conversation,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(device)
+    else:
+        prompt = []
+        for turn in conversation:
+            role = turn["role"].upper()
+            prompt.append(f"{role}: {turn['content']}")
+        prompt.append("ASSISTANT:")
+        prompt_text = "\n".join(prompt)
+        inputs = tokenizer(
+            prompt_text,
+            return_tensors="pt",
+        ).to(device)
 
     with torch.inference_mode():
         outputs = model.generate(
             **inputs,
             max_new_tokens=128,
             pad_token_id=tokenizer.eos_token_id,
+            temperature=0.1,
         )
 
     input_length = inputs["input_ids"].shape[-1]
@@ -84,12 +98,6 @@ def query_model(context_text: str) -> str:
     return decoded[0]
 
 
-def extract_answer(model_response: str) -> str:
-    marker = "Answer:"
-    if marker not in model_response:
-        return model_response.strip()
-    return model_response.split(marker, maxsplit=1)[1].strip()
-
 
 results = []
 
@@ -97,26 +105,18 @@ for item in dataset:
     question = item["question"]
     sessions = item["session"]
     current_idx = 0
-    answer = "I don't know"
 
     while current_idx < len(sessions):
         current_context = sessions[current_idx]
         context = f"Question: {question}\n\nConversation:\n{format_session(current_context)}"
         response = query_model(context)
         print(response)
-        parsed_answer = extract_answer(response)
         current_idx += 1
-
-        if parsed_answer.lower().startswith("i don't know"):
-            continue
-
-        answer = parsed_answer
-        break
 
     results.append(
         {
             "question": question,
-            "answer": answer,
+            "answer": response,
             "chunks_examined": current_idx,
             "chunks_total": len(sessions),
         }

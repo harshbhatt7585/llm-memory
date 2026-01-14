@@ -12,9 +12,11 @@ for item in data:
     if len(dataset) >= total_questions:
         break
     question = item["question"]
+    answer = item["answer"]
     session = item["haystack_sessions"]
-    dataset.append({"question": question, "session": session})
+
+    dataset.append({"question": question, "answer": answer, "session": session})
 
 
 with open("dataset.json", "w") as f:
-    json.dump(dataset, f)
+    json.dump(dataset, f, indent=4)
