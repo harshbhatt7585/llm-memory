@@ -11,6 +11,7 @@ import torch
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import faiss
+from tqdm import tqdm
 
 # Fix FAISS segfault on macOS by disabling OpenMP parallelism
 faiss.omp_set_num_threads(1)
@@ -23,6 +24,7 @@ EMBED_CACHE_PATH = Path("chunk_embeddings.pt")
 FAISS_INDEX_PATH = Path("conversation.index")
 FAISS_METADATA_PATH = Path("conversation_metadata.json")
 RETRIEVAL_TOP_K = 5
+MAX_NEW_TOKENS = 64  # JSON response is short, no need for 128
 
 
 def load_dataset(path: Path) -> List[Dict]:
@@ -43,6 +45,7 @@ def format_session(session: List[Dict[str, str]]) -> str:
     return "\n".join(formatted_turns)
 
 
+@torch.inference_mode()
 def query_model(context_text: str, system_prompt: str) -> str:
     conversation = [
         {"role": "system", "content": system_prompt},
@@ -58,34 +61,20 @@ def query_model(context_text: str, system_prompt: str) -> str:
             return_tensors="pt",
         ).to(model_device)
     else:
-        prompt = []
-        for turn in conversation:
-            role = turn["role"].upper()
-            prompt.append(f"{role}: {turn['content']}")
-        prompt.append("ASSISTANT:")
-        prompt_text = "\n".join(prompt)
-        inputs = tokenizer(prompt_text, return_tensors="pt").to(model_device)
+        prompt = f"SYSTEM: {system_prompt}\nUSER: {context_text}\nASSISTANT:"
+        inputs = tokenizer(prompt, return_tensors="pt").to(model_device)
 
-    with torch.inference_mode():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=128,
-            pad_token_id=tokenizer.eos_token_id,
-            temperature=0.1,
-            top_p=0.95,
-            top_k=40,
-            repetition_penalty=1.18,
-            num_beams=1,
-            no_repeat_ngram_size=3,
-            early_stopping=True,
-            bos_token_id=tokenizer.bos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
+    # Greedy decoding is faster than sampling for deterministic JSON output
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=MAX_NEW_TOKENS,
+        do_sample=False,  # Greedy decoding - faster than sampling
+        pad_token_id=tokenizer.eos_token_id,
+        use_cache=True,
+    )
 
-    input_length = inputs["input_ids"].shape[-1]
-    generated_tokens = outputs[:, input_length:]
-    decoded = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
-    return decoded[0]
+    generated_tokens = outputs[:, inputs["input_ids"].shape[-1]:]
+    return tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
 
 
 def parse_agent_response(raw: str) -> Dict:
@@ -179,12 +168,23 @@ preferred_dtype = (
     torch.float32
 )
 
+print(f"Loading model on {model_device} with {preferred_dtype}...")
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     dtype=preferred_dtype,
 ).to(model_device).eval()
 
+# Compile model for faster inference (PyTorch 2.0+)
+if hasattr(torch, "compile") and model_device.type in ("cuda", "cpu"):
+    try:
+        model = torch.compile(model, mode="reduce-overhead")
+        print("Model compiled with torch.compile()")
+    except Exception as e:
+        print(f"torch.compile() not available: {e}")
+
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
 
 SYSTEM_PROMPT = """You are a memory agent.
 You must answer ONLY using the provided conversation chunk.
@@ -204,28 +204,27 @@ Answer: {"found": false, "answer": ""}
 """
 
 
-retriever = SemanticRetriever(dataset, dataset_hash)
-results = []
-
-for question_idx, item in enumerate(dataset):
+def process_question(
+    question_idx: int,
+    item: Dict,
+    retriever: SemanticRetriever,
+) -> Dict:
+    """Process a single question and return the result dict."""
     question = item["question"]
     sessions = item["session"]
 
     if not sessions:
-        results.append(
-            {
-                "question": question,
-                "answer": "",
-                "chunks_examined": 0,
-                "chunks_total": 0,
-                "retrieved_chunks": [],
-                "chunk_logs": [],
-            }
-        )
-        continue
+        return {
+            "question": question,
+            "answer": "",
+            "chunks_examined": 0,
+            "chunks_total": 0,
+            "retrieved_chunks": [],
+            "chunk_logs": [],
+        }
 
     retrieved = retriever.retrieve(question_idx, question, RETRIEVAL_TOP_K)
-    score_lookup = {chunk_idx: score for chunk_idx, score in retrieved}
+    score_lookup = dict(retrieved)
     chunk_order = [idx for idx, _ in retrieved]
 
     if not chunk_order:
@@ -233,53 +232,56 @@ for question_idx, item in enumerate(dataset):
 
     chunk_logs = []
     final_answer = ""
-    found_answer = False
-
-    print("RETRIEVED CHUNKS:")
-    with open("retrieved_chunks.txt", "w") as f:
-        for chunk_idx in chunk_order:
-            print(f"Chunk {chunk_idx}: {format_session(sessions[chunk_idx])}")
-            f.write(f"Chunk {chunk_idx}: {format_session(sessions[chunk_idx])}\n")
-        print("--------------------------------")
 
     for chunk_idx in chunk_order:
-        current_context = sessions[chunk_idx]
-        context = (
-            f"Question: {question}\n\nConversation:\n{format_session(current_context)}"
-        )
+        context = f"Question: {question}\n\nConversation:\n{format_session(sessions[chunk_idx])}"
         response = query_model(context, SYSTEM_PROMPT)
-        print(response)
-        print("--------------------------------")
         parsed = parse_agent_response(response)
-        chunk_logs.append(
-            {
-                "chunk_index": chunk_idx,
-                "similarity": score_lookup.get(chunk_idx),
-                "response": response,
-                "parsed": parsed,
-            }
-        )
+        
+        chunk_logs.append({
+            "chunk_index": chunk_idx,
+            "similarity": score_lookup.get(chunk_idx),
+            "response": response,
+            "parsed": parsed,
+        })
+        
         if parsed.get("found"):
             final_answer = parsed.get("answer", "")
-            found_answer = True
             break
+    else:
+        # No answer found in any chunk
+        if chunk_logs:
+            final_answer = chunk_logs[-1]["parsed"].get("answer", "")
 
-    if not found_answer and chunk_logs:
-        final_answer = chunk_logs[-1]["parsed"].get("answer", "")
+    return {
+        "question": question,
+        "answer": final_answer,
+        "chunks_examined": len(chunk_logs),
+        "chunks_total": len(sessions),
+        "retrieved_chunks": chunk_order,
+        "chunk_logs": chunk_logs,
+    }
 
-    results.append(
-        {
-            "question": question,
-            "answer": final_answer,
-            "chunks_examined": len(chunk_logs),
-            "chunks_total": len(sessions),
-            "retrieved_chunks": chunk_order,
-            "chunk_logs": chunk_logs,
-        }
-    )
 
-output_path = Path("results.json")
-with output_path.open("w") as fh:
-    json.dump(results, fh, indent=2)
+def main():
+    print(f"Processing {len(dataset)} questions...")
+    retriever = SemanticRetriever(dataset, dataset_hash)
+    
+    results = []
+    for question_idx, item in enumerate(tqdm(dataset, desc="Questions")):
+        result = process_question(question_idx, item, retriever)
+        results.append(result)
+    
+    output_path = Path("results.json")
+    with output_path.open("w") as fh:
+        json.dump(results, fh, indent=2)
+    
+    # Summary stats
+    total_chunks = sum(r["chunks_examined"] for r in results)
+    found_count = sum(1 for r in results if r["answer"])
+    print(f"\nSaved {len(results)} answers to {output_path}")
+    print(f"Found answers: {found_count}/{len(results)}, Total chunks examined: {total_chunks}")
 
-print(f"Saved {len(results)} answers to {output_path}")
+
+if __name__ == "__main__":
+    main()
