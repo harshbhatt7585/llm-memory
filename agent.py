@@ -2,18 +2,26 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import numpy as np
 import torch
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import faiss
+
+# Fix FAISS segfault on macOS by disabling OpenMP parallelism
+faiss.omp_set_num_threads(1)
 
 
 DATASET_PATH = Path("dataset.json")
 MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
 EMBED_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
 EMBED_CACHE_PATH = Path("chunk_embeddings.pt")
+FAISS_INDEX_PATH = Path("conversation.index")
+FAISS_METADATA_PATH = Path("conversation_metadata.json")
 RETRIEVAL_TOP_K = 5
 
 
@@ -31,9 +39,7 @@ def compute_file_hash(path: Path) -> str:
 
 
 def format_session(session: List[Dict[str, str]]) -> str:
-    formatted_turns = [
-        f"{turn['role'].capitalize()}: {turn['content']}" for turn in session
-    ]
+    formatted_turns = [f"{turn['role'].capitalize()}: {turn['content']}" for turn in session]
     return "\n".join(formatted_turns)
 
 
@@ -109,87 +115,64 @@ class SemanticRetriever:
         self.embed_device = "cuda" if torch.cuda.is_available() else "cpu"
         self.embed_torch_device = torch.device(self.embed_device)
         self.embedder = SentenceTransformer(self.model_name, device=self.embed_device)
-        self.embeddings = self._load_or_build_embeddings()
+        self.index = faiss.read_index(str(FAISS_INDEX_PATH))
+        self.metadata = self._load_metadata()
+        self.chunk_lookup = {entry["chunk_id"]: entry for entry in self.metadata}
 
-
-
-    def _load_or_build_embeddings(self):
-        if self.cache_path.exists():
-            stored = torch.load(self.cache_path, map_location="cpu")
-            if stored.get("dataset_hash") == self.dataset_hash:
-                metadata = stored["metadata"]
-                embeddings = stored["embeddings"]
-            else:
-                embeddings = self._compute_and_store_embeddings()
-        else:
-            embeddings = self._compute_and_store_embeddings()
-
-        embeddings = embeddings.to(self.embed_torch_device)
-        embeddings
-
-    def _compute_and_store_embeddings(self):
-        chunk_texts = []
-        metadata = []
-        for q_idx, item in enumerate(self.dataset):
-            for chunk_idx, chunk in enumerate(item["session"]):
-                metadata.append({"question_idx": q_idx, "chunk_idx": chunk_idx})
-                chunk_texts.append(format_session(chunk))
-
-        embeddings = self.embedder.encode(
-            chunk_texts,
-            convert_to_tensor=True,
-            batch_size=32,
-            show_progress_bar=True,
-            normalize_embeddings=True,
-        )
-
-        embeddings_cpu = embeddings.cpu()
-        torch.save(
-            {
-                "metadata": metadata,
-                "embeddings": embeddings_cpu,
-                "dataset_hash": self.dataset_hash,
-            },
-            self.cache_path,
-        )
-        return embeddings_cpu
+    def _load_metadata(self) -> List[Dict]:
+        with FAISS_METADATA_PATH.open("r") as fh:
+            payload = json.load(fh)
+        stored_hash = payload.get("dataset_hash")
+        if stored_hash != self.dataset_hash:
+            raise RuntimeError(
+                "Metadata hash mismatch. Regenerate the FAISS index via prepare_dataset.py"
+            )
+        chunks = payload.get("chunks", [])
+        chunks.sort(key=lambda item: item["chunk_id"])  # keep aligned with FAISS ids
+        return chunks
 
     def retrieve(self, question_idx: int, question: str, top_k: int) -> List[Tuple[int, float]]:
-        candidate_positions = self.question_to_positions.get(question_idx, [])
-        if not candidate_positions:
-            return []
-
-        chunk_embeddings = self.embeddings[candidate_positions]
         query_embedding = self.embedder.encode(
-            question,
-            convert_to_tensor=True,
+            [question],
+            convert_to_numpy=True,
             normalize_embeddings=True,
+            show_progress_bar=False,
         )
-        if query_embedding.device != chunk_embeddings.device:
-            query_embedding = query_embedding.to(chunk_embeddings.device)
+        if query_embedding.ndim == 1:
+            query_embedding = np.expand_dims(query_embedding, axis=0)
 
-        scores = torch.matmul(chunk_embeddings, query_embedding.unsqueeze(-1)).squeeze(-1)
-        k = min(top_k, scores.shape[0])
-        if k == 0:
-            return []
+        search_k = min(max(top_k * 5, top_k), self.index.ntotal)
+        scores, indices = self.index.search(query_embedding, search_k)
 
-        top_scores, top_indices = torch.topk(scores, k=k)
-        results: List[Tuple[int, float]] = []
-        for score, local_idx in zip(top_scores.tolist(), top_indices.tolist()):
-            meta_idx = candidate_positions[local_idx]
-            chunk_idx = self.metadata[meta_idx]["chunk_idx"]
-            results.append((chunk_idx, float(score)))
-        return results
+        filtered: List[Tuple[int, float]] = []
+        for chunk_id, score in zip(indices[0], scores[0]):
+            if chunk_id == -1:
+                continue
+            meta = self.chunk_lookup.get(int(chunk_id))
+            if not meta or meta["question_idx"] != question_idx:
+                continue
+            filtered.append((meta["chunk_idx"], float(score)))
+            if len(filtered) == top_k:
+                break
+        return filtered
 
 
 dataset = load_dataset(DATASET_PATH)
 dataset_hash = compute_file_hash(DATASET_PATH)
 
-model_device = (
-    torch.device("cuda") if torch.cuda.is_available() else
-    torch.device("mps") if torch.backends.mps.is_available() else
-    torch.device("cpu")
-)
+def resolve_model_device() -> torch.device:
+    requested = os.environ.get("LLM_DEVICE")
+    if requested:
+        return torch.device(requested)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    # Default to CPU unless the user explicitly opts in to MPS via env var.
+    if os.environ.get("ENABLE_MPS", "0") == "1" and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+model_device = resolve_model_device()
 preferred_dtype = (
     torch.bfloat16 if model_device.type == "cuda" else
     torch.float16 if model_device.type == "mps" else
@@ -198,7 +181,7 @@ preferred_dtype = (
 
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
-    torch_dtype=preferred_dtype,
+    dtype=preferred_dtype,
 ).to(model_device).eval()
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
