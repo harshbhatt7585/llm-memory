@@ -109,14 +109,9 @@ class SemanticRetriever:
         self.embed_device = "cuda" if torch.cuda.is_available() else "cpu"
         self.embed_torch_device = torch.device(self.embed_device)
         self.embedder = SentenceTransformer(self.model_name, device=self.embed_device)
-        self.metadata, self.embeddings = self._load_or_build_embeddings()
-        self.question_to_positions = self._build_question_map()
+        self.embeddings = self._load_or_build_embeddings()
 
-    def _build_question_map(self) -> Dict[int, List[int]]:
-        mapping: Dict[int, List[int]] = {}
-        for idx, meta in enumerate(self.metadata):
-            mapping.setdefault(meta["question_idx"], []).append(idx)
-        return mapping
+
 
     def _load_or_build_embeddings(self):
         if self.cache_path.exists():
@@ -125,12 +120,12 @@ class SemanticRetriever:
                 metadata = stored["metadata"]
                 embeddings = stored["embeddings"]
             else:
-                metadata, embeddings = self._compute_and_store_embeddings()
+                embeddings = self._compute_and_store_embeddings()
         else:
-            metadata, embeddings = self._compute_and_store_embeddings()
+            embeddings = self._compute_and_store_embeddings()
 
         embeddings = embeddings.to(self.embed_torch_device)
-        return metadata, embeddings
+        embeddings
 
     def _compute_and_store_embeddings(self):
         chunk_texts = []
@@ -157,7 +152,7 @@ class SemanticRetriever:
             },
             self.cache_path,
         )
-        return metadata, embeddings_cpu
+        return embeddings_cpu
 
     def retrieve(self, question_idx: int, question: str, top_k: int) -> List[Tuple[int, float]]:
         candidate_positions = self.question_to_positions.get(question_idx, [])
@@ -256,6 +251,13 @@ for question_idx, item in enumerate(dataset):
     chunk_logs = []
     final_answer = ""
     found_answer = False
+
+    print("RETRIEVED CHUNKS:")
+    with open("retrieved_chunks.txt", "w") as f:
+        for chunk_idx in chunk_order:
+            print(f"Chunk {chunk_idx}: {format_session(sessions[chunk_idx])}")
+            f.write(f"Chunk {chunk_idx}: {format_session(sessions[chunk_idx])}\n")
+        print("--------------------------------")
 
     for chunk_idx in chunk_order:
         current_context = sessions[chunk_idx]
