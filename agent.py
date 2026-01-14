@@ -256,6 +256,7 @@ def main() -> None:
 
 
 
+
 def search_agent(question: str, model, trials=20) -> str:
     """This agent will search the conversation in the vector db, it will create query for vector db"""
 
@@ -290,10 +291,48 @@ def search_agent(question: str, model, trials=20) -> str:
             top_k=40,
         )
 
-        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        response = tokenizer.decode(outputs[:, inputs["input_ids"].shape[-1]:], skip_special_tokens=True)
         
         results = search_vector_db(response)
+
+        messages.append({
+            "role": "assistant",
+            "content": response
+        })
+
+
+        messages.append({
+            "role": "user",
+            "content": f"the results are: {results}, Can you find the answer to the question: {question}? If you found the answer, output JSON: {"found": true, "answer": "..."}, If not, output: {"found": false, "answer": ""}"
+        })
+
+        inputs = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(model_device)
+
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
+            pad_token_id=tokenizer.eos_token_id,
+            use_cache=True,
+            temperature=0.1,
+            top_p=0.95,
+            top_k=40,
+        )
+        response = tokenizer.decode(outputs[:, inputs["input_ids"].shape[-1]:], skip_special_tokens=True)
+        parsed = parse_agent_response(response)
+        if parsed.get("found"):
+            return parsed.get("answer", "")
         
+
+    return ""
+
+
+
 
 
 
