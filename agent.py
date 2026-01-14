@@ -39,12 +39,13 @@ model = AutoModelForCausalLM.from_pretrained(
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 
 
-SYSTEM_PROMPT = (
-    "You are memory agent, who goes through all the conversation to find the relevant answer. "
-    "If the conversation contains the answer, respond with the answrr."
-    "If you cannot find the answer in the conversation, respond with 'I don't know'."
-    "Only Response in JSON format: {'answer': 'the answer'}"
-)
+SYSTEM_PROMPT = """You are a memory agent.
+You must answer ONLY using the provided conversation chunk.
+If the chunk contains the answer, output JSON:
+{"found": true, "answer": "..."}
+If not, output:
+{"found": false, "answer": ""}
+Output VALID JSON only (double quotes)."""
 
 
 def format_session(session: List[Dict[str, str]]) -> str:
@@ -60,7 +61,7 @@ def query_model(context_text: str) -> str:
         {"role": "system", "content": SYSTEM_PROMPT},
         {
             "role": "user",
-            "content": f"Question and conversation:\n\n{context_text}",
+            "content": f"Question and conversation:\n\n{context_text}.  \n\nresonse in JSON format",
         },
     ]
 
@@ -108,7 +109,7 @@ for item in dataset:
 
     while current_idx < len(sessions):
         current_context = sessions[current_idx]
-        context = f"Question: {question}\n\nConversation:\n{format_session(current_context)}"
+        context = f"\n\nConversation:\n{format_session(current_context)}. Answer the question: {question}"
         response = query_model(context)
         print(response)
         current_idx += 1
