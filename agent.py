@@ -68,9 +68,15 @@ def query_model(context_text: str, system_prompt: str) -> str:
     outputs = model.generate(
         **inputs,
         max_new_tokens=MAX_NEW_TOKENS,
-        do_sample=False,  # Greedy decoding - faster than sampling
         pad_token_id=tokenizer.eos_token_id,
         use_cache=True,
+        temperature=0.1,
+        top_p=0.95,
+        top_k=40,
+        repetition_penalty=1.2,
+        early_stopping=True,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
     )
 
     generated_tokens = outputs[:, inputs["input_ids"].shape[-1]:]
@@ -156,7 +162,7 @@ def resolve_model_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     # Default to CPU unless the user explicitly opts in to MPS via env var.
-    if os.environ.get("ENABLE_MPS", "0") == "1" and torch.backends.mps.is_available():
+    if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
 
@@ -236,6 +242,7 @@ def process_question(
     for chunk_idx in chunk_order:
         context = f"Question: {question}\n\nConversation:\n{format_session(sessions[chunk_idx])}"
         response = query_model(context, SYSTEM_PROMPT)
+        print(response)
         parsed = parse_agent_response(response)
         
         chunk_logs.append({
@@ -269,6 +276,8 @@ def main():
     
     results = []
     for question_idx, item in enumerate(tqdm(dataset, desc="Questions")):
+        if question_idx != 0:
+            break
         result = process_question(question_idx, item, retriever)
         results.append(result)
     
