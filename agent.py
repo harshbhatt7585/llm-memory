@@ -217,11 +217,11 @@ If not, output:
 Output VALID JSON only (double quotes).
 
 EXAMPLE:
-"Harsh went to the gym on Monday at 7PM, he came back and slept. He woke up at 9AM next day and went to the office."
+"X went to the gym on Monday at 7PM, he came back and slept. He woke up at 9AM next day and went to the office."
 Question: At what time did Harsh went to the gym on Monday?
 Answer: {"found": true, "answer": "He went to the gym at 7PM"}
 
-Question: Why Harsh was upset in the office?
+Question: Why X was upset in the office?
 Answer: {"found": false, "answer": ""}
 """
 
