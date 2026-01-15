@@ -5,10 +5,25 @@ from typing import List
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+import faiss
+
 
 load_dotenv()
 
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
+
+
+def load_faiss_index(index_path: str) -> faiss.Index:
+    return faiss.read_index(index_path)
+
+
+def search_faiss_index(index: faiss.Index, query: str) -> List[dict]:
+    return index.search(query, 10)
+
+
+def load_dataset(dataset_path: str):
+    with open(dataset_path, "r") as f:
+        return json.load(f)
 
 
 def _get_client() -> genai.Client:
@@ -87,7 +102,17 @@ def query_generate_agent(question: str) -> str:
     return parsed_response.get("query", "")
 
 
+
+
+
+
+
 if __name__ == "__main__":
-    prompt = "What did I eat on Friday?"
-    response = query_generate_agent(prompt)
-    print(response)
+    # prompt = "What did I eat on Friday?"
+    # response = query_generate_agent(prompt)
+    # print(response)
+
+    dataset = load_dataset("dataset.json")
+    index = load_faiss_index("conversation.index")
+    print(index)
+    search_results = search_faiss_index(index, "What did I eat on Friday?")
