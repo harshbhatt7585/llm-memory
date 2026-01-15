@@ -31,7 +31,7 @@ class RAGTool(Tools):
     """Tool for retrieving information from the RAG index."""
     def __call__(self, query: str, k: int = 5) -> dict:
         """Retrieve information from the RAG index."""
-        return retrieve_top_k_chunks(query, k)
+        return retrieve_top_k_chunks(query, embedder, index, metadata, k)
 
 
 def load_embedder(model_name: str) -> SentenceTransformer:
@@ -136,7 +136,6 @@ def retrieve_top_k_chunks(
     return chunks
 
 
-
 def query_generate_agent(question: str) -> str:
     system_prompt = (
         "You are a memory search agent. All conversation history lives in a vector DB, "
@@ -163,31 +162,54 @@ def query_generate_agent(question: str) -> str:
 
 
 def search_agent(question: str, chunks: List[dict]):
-    
+
+    rag_tool = RAGTool(name="RAGTool", description="Retrieve information from the RAG index.", parameters={"query": str, "k": int})
 
     system_prompt = (
         "You are a search agent who searches the answer to the question from the conversation.",
         "Given a question like 'What did I order last night at the <restaurant_name> restaurant?', "
-        "You will also get the conext which is a bunch of chunks from the conversation.",
-        "Think step by step and reason about the question and the context to find the answer.",
+        "You have the following tools to use: RAGTool",
+        "RAGTool is a tool that can be used to retrieve information from the RAG index.",
+        "RAGTool takes a query and a number of chunks to retrieve.",
+        "RAGTool returns a list of chunks that are similar to the query.",
+        "You have to crwal the conversation to find the answer to the question.",
+        "Think step by step and reason about the question and the context to find the answer using the RAGTool.",
+        "To call the RAGTool, you need to use the following JSON format: {'tool': 'RAGTool', 'args': {'query': <query>, 'k': <k>}}",
         "You have to find the answer in the conversation",
         """return the answer in the form of JSON: {"found": true, "answer": <answer>}""",
         "If you think there is no valid answer to question"
         """return the answer in the form of JSON: {"found": false, "answer": ""}""",
     )
-
     contents = [
         types.Content(
             role="user",
-            parts=[types.Part(text=f"Context: {chunks} Question: {question}")],
-        )
+            parts=[types.Part(text=f"Context: {chunks if chunks else ''} Question: {question}")],
+        ),
     ]
+
+
+    print("calling gemini request ")
 
     response = generate_chat_completion(
         contents=contents,
         system_instruction=system_prompt,
     )
+
+    print("response: ", response)
+
+
     parsed_response = parse_agent_response(response)
+
+    if parsed_response.get("tool") == "RAGTool":
+        
+        args = parsed_response.get("args")
+        if args:
+            print("calling RAGTool")
+            chunk = rag_tool(args["query"], args["k"])
+            return search_agent(question, chunk) 
+        else:
+            print("no args found")
+
     return parsed_response
 
     
@@ -201,8 +223,7 @@ if __name__ == "__main__":
     dataset = load_dataset("dataset.json")
     question = dataset[0]["question"]
 
-    query = query_generate_agent(question)
-
+    global embedder, index, metadata
     
     # Load required components
     embedder = load_embedder("sentence-transformers/all-MiniLM-L6-v2")
@@ -210,7 +231,7 @@ if __name__ == "__main__":
     metadata = load_metadata("conversation_metadata.json")
     
     # Perform similarity search
-    chunks = retrieve_top_k_chunks(query, embedder, index, metadata, k=3)
+    # chunks = retrieve_top_k_chunks(query, embedder, index, metadata, k=3)
  
-    answer = search_agent(question, chunks)
+    answer = search_agent(question, None)
     print(answer)
