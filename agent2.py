@@ -6,23 +6,41 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 import faiss
-
+from sentence_transformers import SentenceTransformer
+import numpy as np
 
 load_dotenv()
 
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
 
 
+def load_embedder(model_name: str) -> SentenceTransformer:
+    return SentenceTransformer(model_name)
+
+
+def generate_embedding(embedder: SentenceTransformer, text: str, faiss: faiss.Index) -> np.ndarray:
+    """Return embedding with batch dimension for Faiss search."""
+    encoding = embedder.encode(text)
+    return np.asarray(encoding, dtype=np.float32).reshape(1, -1)
+
+
 def load_faiss_index(index_path: str) -> faiss.Index:
     return faiss.read_index(index_path)
 
 
-def search_faiss_index(index: faiss.Index, query: str) -> List[dict]:
-    return index.search(query, 10)
+def search_faiss_index(index: faiss.Index, encoding: np.ndarray, k: int = 10) -> tuple:
+    """Return distances and indices from FAISS search."""
+    return index.search(encoding, k=k)
 
 
 def load_dataset(dataset_path: str):
     with open(dataset_path, "r") as f:
+        return json.load(f)
+
+
+def load_metadata(metadata_path: str) -> dict:
+    """Load conversation metadata that maps chunk IDs to chunk data."""
+    with open(metadata_path, "r") as f:
         return json.load(f)
 
 
@@ -78,6 +96,26 @@ def parse_agent_response(response: str) -> dict:
         return {"query": response.strip(), "context": ""}
 
 
+def retrieve_top_k_chunks(
+    query: str,
+    embedder: SentenceTransformer,
+    index: faiss.Index,
+    metadata: dict,
+    k: int = 5
+) -> List[dict]:
+    encoding = generate_embedding(embedder, query, index)
+    distances, indices = search_faiss_index(index, encoding, k=k)
+    chunks = []
+    for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
+        if idx < len(metadata["chunks"]):
+            chunk_data = metadata["chunks"][idx].copy()
+            chunk_data["similarity_score"] = float(dist)
+            chunk_data["rank"] = i + 1
+            chunks.append(chunk_data)
+
+    return chunks
+
+
 def query_generate_agent(question: str) -> str:
     system_prompt = (
         "You are a memory search agent. All conversation history lives in a vector DB, "
@@ -108,11 +146,15 @@ def query_generate_agent(question: str) -> str:
 
 
 if __name__ == "__main__":
-    # prompt = "What did I eat on Friday?"
-    # response = query_generate_agent(prompt)
-    # print(response)
-
+    # Example: Retrieve top 3 chunks for a query
     dataset = load_dataset("dataset.json")
+    question = dataset[0]["question"]
+    
+    # Load required components
+    embedder = load_embedder("sentence-transformers/all-MiniLM-L6-v2")
     index = load_faiss_index("conversation.index")
-    print(index)
-    search_results = search_faiss_index(index, "What did I eat on Friday?")
+    metadata = load_metadata("conversation_metadata.json")
+    
+    # Perform similarity search
+    chunks = retrieve_top_k_chunks(question, embedder, index, metadata, k=3)
+    print(chunks)
