@@ -41,7 +41,12 @@ def load_embedder(model_name: str) -> SentenceTransformer:
 def generate_embedding(embedder: SentenceTransformer, text: str, faiss: faiss.Index) -> np.ndarray:
     """Return embedding with batch dimension for Faiss search."""
     encoding = embedder.encode(text)
-    return np.asarray(encoding, dtype=np.float32).reshape(1, -1)
+    return normalize_embedding(np.asarray(encoding, dtype=np.float32).reshape(1, -1))
+
+
+
+def normalize_embedding(embedding: np.ndarray) -> np.ndarray:
+    return embedding / np.linalg.norm(embedding)
 
 
 def load_faiss_index(index_path: str) -> faiss.Index:
@@ -186,8 +191,6 @@ def search_agent(question: str, chunks: List[dict]):
             parts=[types.Part(text=f"Context: {chunks if chunks else ''} Question: {question}")],
         ),
     ]
-
-
     print("calling gemini request ")
 
     response = generate_chat_completion(
