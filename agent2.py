@@ -116,6 +116,7 @@ def retrieve_top_k_chunks(
     return chunks
 
 
+
 def query_generate_agent(question: str) -> str:
     system_prompt = (
         "You are a memory search agent. All conversation history lives in a vector DB, "
@@ -141,6 +142,36 @@ def query_generate_agent(question: str) -> str:
 
 
 
+def search_agent(question: str, chunks: List[dict]):
+    
+
+    system_prompt = (
+        "You are a search agent who searches the answer to the question from the conversation.",
+        "Given a question like 'What did I order last night at the <restaurant_name> restaurant?', "
+        "You will also get the conext which is a bunch of chunks from the conversation.",
+        "Think step by step and reason about the question and the context to find the answer.",
+        "You have to find the answer in the conversation",
+        """return the answer in the form of JSON: {"found": true, "answer": <answer>}""",
+        "If you think there is no valid answer to question"
+        """return the answer in the form of JSON: {"found": false, "answer": ""}""",
+    )
+
+    contents = [
+        types.Content(
+            role="user",
+            parts=[types.Part(text=f"Context: {chunks} Question: {question}")],
+        )
+    ]
+
+    response = generate_chat_completion(
+        contents=contents,
+        system_instruction=system_prompt,
+    )
+    parsed_response = parse_agent_response(response)
+    return parsed_response
+
+    
+
 
 
 
@@ -149,6 +180,9 @@ if __name__ == "__main__":
     # Example: Retrieve top 3 chunks for a query
     dataset = load_dataset("dataset.json")
     question = dataset[0]["question"]
+
+    query = query_generate_agent(question)
+
     
     # Load required components
     embedder = load_embedder("sentence-transformers/all-MiniLM-L6-v2")
@@ -156,5 +190,7 @@ if __name__ == "__main__":
     metadata = load_metadata("conversation_metadata.json")
     
     # Perform similarity search
-    chunks = retrieve_top_k_chunks(question, embedder, index, metadata, k=3)
-    print(chunks)
+    chunks = retrieve_top_k_chunks(query, embedder, index, metadata, k=3)
+ 
+    answer = search_agent(question, chunks)
+    print(answer)
