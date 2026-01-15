@@ -27,7 +27,11 @@ class Tools:
         raise NotImplementedError("Subclasses must implement this method.")
 
 
-
+class RAGTool(Tools):
+    """Tool for retrieving information from the RAG index."""
+    def __call__(self, query: str, k: int = 5) -> dict:
+        """Retrieve information from the RAG index."""
+        return retrieve_top_k_chunks(query, k)
 
 
 def load_embedder(model_name: str) -> SentenceTransformer:
