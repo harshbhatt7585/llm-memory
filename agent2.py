@@ -14,6 +14,22 @@ load_dotenv()
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
 
 
+class Tools:
+    """Abstraction for tools that can be used in the agent."""
+    
+    def __init__(self, name: str, description: str, parameters: dict):
+        self.name = name
+        self.description = description
+        self.parameters = parameters
+    
+    def __call__(self, **kwargs) -> dict:
+        """Execute the tool with the given arguments."""
+        raise NotImplementedError("Subclasses must implement this method.")
+
+
+
+
+
 def load_embedder(model_name: str) -> SentenceTransformer:
     return SentenceTransformer(model_name)
 
