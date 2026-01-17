@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import List
 
 from dotenv import load_dotenv
@@ -11,7 +12,13 @@ import numpy as np
 
 load_dotenv()
 
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemma-3-27b-it")
+
+
+def _supports_system_instruction(model_name: str) -> bool:
+    lowered = model_name.lower()
+    # Gemma chat models currently reject developer instructions.
+    return not lowered.startswith("gemma-")
 
 
 class Tools:
@@ -83,13 +90,22 @@ def generate_response(
 ) -> str:
     """Simple single-turn generation."""
     client = _get_client()
+    target_model = model_name or MODEL_NAME
     config = None
+    fallback_instruction = None
     if system_instruction:
-        config = types.GenerateContentConfig(system_instruction=system_instruction)
-    
+        if _supports_system_instruction(target_model):
+            config = types.GenerateContentConfig(system_instruction=system_instruction)
+        else:
+            fallback_instruction = system_instruction
+
+    contents = prompt
+    if fallback_instruction:
+        contents = f"{fallback_instruction}\n\n{prompt}" if prompt else fallback_instruction
+
     response = client.models.generate_content(
-        model=model_name or MODEL_NAME,
-        contents=prompt,
+        model=target_model,
+        contents=contents,
         config=config,
     )
     return response.text.strip()
@@ -102,12 +118,25 @@ def generate_chat_completion(
 ) -> str:
     """Multi-turn chat completion using typed Content objects."""
     client = _get_client()
+    target_model = model_name or MODEL_NAME
     config = None
+    prepend_instruction = None
     if system_instruction:
-        config = types.GenerateContentConfig(system_instruction=system_instruction)
-    
+        if _supports_system_instruction(target_model):
+            config = types.GenerateContentConfig(system_instruction=system_instruction)
+        else:
+            prepend_instruction = system_instruction
+
+    if prepend_instruction:
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part(text=prepend_instruction)],
+            )
+        ] + contents
+
     response = client.models.generate_content(
-        model=model_name or MODEL_NAME,
+        model=target_model,
         contents=contents,
         config=config,
     )
@@ -115,10 +144,36 @@ def generate_chat_completion(
 
 
 def parse_agent_response(response: str) -> dict:
+    """Parse JSON from LLM response, handling markdown code blocks."""
+    
+    # First, try direct JSON parsing
     try:
-        return json.loads(response)
-    except ValueError:
-        return {"query": response.strip(), "context": ""}
+        return json.loads(response.strip())
+    except (ValueError, json.JSONDecodeError):
+        pass
+    
+    # Try to extract JSON from markdown code blocks (```json ... ``` or ``` ... ```)
+    code_block_pattern = r'```(?:json)?\s*\n?([\s\S]*?)\n?```'
+    matches = re.findall(code_block_pattern, response)
+    
+    for match in matches:
+        try:
+            return json.loads(match.strip())
+        except (ValueError, json.JSONDecodeError):
+            continue
+    
+    # Try to find raw JSON object in the response
+    json_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
+    json_matches = re.findall(json_pattern, response)
+    
+    for match in json_matches:
+        try:
+            return json.loads(match)
+        except (ValueError, json.JSONDecodeError):
+            continue
+    
+    # Fallback: return empty result
+    return {"found": False, "answer": "", "error": "Could not parse response"}
 
 
 def retrieve_top_k_chunks(
@@ -171,19 +226,19 @@ def search_agent(question: str, chunks: List[dict]):
     rag_tool = RAGTool(name="RAGTool", description="Retrieve information from the RAG index.", parameters={"query": str, "k": int})
 
     system_prompt = (
-        "You are a search agent who searches the answer to the question from the conversation.",
+        "You are a search agent who searches the answer to the question from the conversation. "
         "Given a question like 'What did I order last night at the <restaurant_name> restaurant?', "
-        "You have the following tools to use: RAGTool",
-        "RAGTool is a tool that can be used to retrieve information from the RAG index.",
-        "RAGTool takes a query and a number of chunks to retrieve.",
-        "RAGTool returns a list of chunks that are similar to the query.",
-        "You have to crwal the conversation to find the answer to the question.",
-        "Think step by step and reason about the question and the context to find the answer using the RAGTool.",
-        "To call the RAGTool, you need to use the following JSON format: {'tool': 'RAGTool', 'args': {'query': <query>, 'k': <k>}}",
-        "You have to find the answer in the conversation",
-        """return the answer in the form of JSON: {"found": true, "answer": <answer>}""",
-        "If you think there is no valid answer to question"
-        """return the answer in the form of JSON: {"found": false, "answer": ""}""",
+        "You have the following tools to use: RAGTool. "
+        "RAGTool is a tool that can be used to retrieve information from the RAG index. "
+        "RAGTool takes a query and a number of chunks to retrieve. "
+        "RAGTool returns a list of chunks that are similar to the query. "
+        "You have to crawl the conversation to find the answer to the question. "
+        "Think step by step and reason about the question and the context to find the answer using the RAGTool. "
+        "To call the RAGTool, you need to use the following JSON format: {'tool': 'RAGTool', 'args': {'query': <query>, 'k': <k>}}. "
+        "You have to find the answer in the conversation. "
+        'Return the answer in the form of JSON: {"found": true, "answer": <answer>}. '
+        "If you think there is no valid answer to question, "
+        'return the answer in the form of JSON: {"found": false, "answer": ""}.'
     )
     contents = [
         types.Content(
@@ -202,10 +257,11 @@ def search_agent(question: str, chunks: List[dict]):
 
 
     parsed_response = parse_agent_response(response)
-
+    print("parsed_response: ", parsed_response)
     if parsed_response.get("tool") == "RAGTool":
         
         args = parsed_response.get("args")
+        print("args: ", args)
         if args:
             print("calling RAGTool")
             chunk = rag_tool(args["query"], args["k"])
@@ -215,8 +271,6 @@ def search_agent(question: str, chunks: List[dict]):
 
     return parsed_response
 
-    
-
 
 
 
@@ -224,6 +278,7 @@ def search_agent(question: str, chunks: List[dict]):
 if __name__ == "__main__":
     # Example: Retrieve top 3 chunks for a query
     dataset = load_dataset("dataset.json")
+    import time
     question = dataset[0]["question"]
 
     global embedder, index, metadata
@@ -235,6 +290,6 @@ if __name__ == "__main__":
     
     # Perform similarity search
     # chunks = retrieve_top_k_chunks(query, embedder, index, metadata, k=3)
- 
+
     answer = search_agent(question, None)
     print(answer)
