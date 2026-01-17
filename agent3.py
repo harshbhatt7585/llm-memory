@@ -1,24 +1,18 @@
 import json
 import os
 import re
-from typing import List
+from typing import List, Dict, Any
 
+import requests
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 import faiss
 from sentence_transformers import SentenceTransformer
 import numpy as np
 
 load_dotenv()
 
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemma-3-27b-it")
-
-
-def _supports_system_instruction(model_name: str) -> bool:
-    lowered = model_name.lower()
-    # Gemma chat models currently reject developer instructions.
-    return not lowered.startswith("gemma-")
+MODEL_NAME = os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-20b:free")
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
 class Tools:
@@ -45,11 +39,10 @@ def load_embedder(model_name: str) -> SentenceTransformer:
     return SentenceTransformer(model_name)
 
 
-def generate_embedding(embedder: SentenceTransformer, text: str, faiss: faiss.Index) -> np.ndarray:
+def generate_embedding(embedder: SentenceTransformer, text: str, faiss_index: faiss.Index) -> np.ndarray:
     """Return embedding with batch dimension for Faiss search."""
     encoding = embedder.encode(text)
     return normalize_embedding(np.asarray(encoding, dtype=np.float32).reshape(1, -1))
-
 
 
 def normalize_embedding(embedding: np.ndarray) -> np.ndarray:
@@ -76,11 +69,79 @@ def load_metadata(metadata_path: str) -> dict:
         return json.load(f)
 
 
-def _get_client() -> genai.Client:
-    api_key = os.getenv("GEMINI_API_KEY")
+def _get_api_key() -> str:
+    api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set in the environment")
-    return genai.Client(api_key=api_key)
+        raise RuntimeError("OPENROUTER_API_KEY is not set in the environment")
+    return api_key
+
+
+def _is_reasoning_model(model_name: str) -> bool:
+    """Check if the model supports reasoning parameters."""
+    reasoning_models = [
+        "gpt-oss-120b",
+        "gpt-oss-20b", 
+        "o3", "o4",
+        "o1", "o3-mini", "o4-mini",
+        "deepseek-r1",
+    ]
+    lowered = model_name.lower()
+    return any(rm in lowered for rm in reasoning_models)
+
+
+def _make_openrouter_request(
+    messages: List[Dict[str, str]],
+    model_name: str | None = None,
+    temperature: float = 0.0,
+    enable_reasoning: bool = False,
+) -> str:
+    """Make a request to OpenRouter API."""
+    api_key = _get_api_key()
+    target_model = model_name or MODEL_NAME
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/llm-memory",  # Optional, for OpenRouter rankings
+    }
+    
+    # For free models, we need to allow data sharing
+    # You can also set this globally at https://openrouter.ai/settings/privacy
+    if ":free" in target_model:
+        headers["X-Allow-Downstream-Training"] = "true"
+    
+    payload = {
+        "model": target_model,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    
+    # Enable reasoning for supported models
+    if enable_reasoning and _is_reasoning_model(target_model):
+        payload["reasoning"] = {"enabled": True}
+    
+    response = requests.post(
+        OPENROUTER_API_URL,
+        headers=headers,
+        json=payload,
+        timeout=300,  # Longer timeout for reasoning models
+    )
+    
+    if response.status_code != 200:
+        raise RuntimeError(f"OpenRouter API error: {response.status_code} - {response.text}")
+    
+    result = response.json()
+    
+    # Extract response content
+    message = result["choices"][0]["message"]
+    content = message.get("content", "").strip()
+    
+    # Optionally log reasoning if present
+    reasoning_details = message.get("reasoning_details")
+    if reasoning_details:
+        print(f"[Reasoning]: {reasoning_details[:500]}..." if len(str(reasoning_details)) > 500 else f"[Reasoning]: {reasoning_details}")
+    
+    return content
 
 
 def generate_response(
@@ -90,65 +151,39 @@ def generate_response(
     temperature: float = 0.0,
 ) -> str:
     """Simple single-turn generation."""
-    client = _get_client()
-    target_model = model_name or MODEL_NAME
-    fallback_instruction = None
+    messages = []
     
-    config_kwargs = {"temperature": temperature}
     if system_instruction:
-        if _supports_system_instruction(target_model):
-            config_kwargs["system_instruction"] = system_instruction
-        else:
-            fallback_instruction = system_instruction
-
-    config = types.GenerateContentConfig(**config_kwargs)
-
-    contents = prompt
-    if fallback_instruction:
-        contents = f"{fallback_instruction}\n\n{prompt}" if prompt else fallback_instruction
-
-    response = client.models.generate_content(
-        model=target_model,
-        contents=contents,
-        config=config,
+        messages.append({"role": "system", "content": system_instruction})
+    
+    messages.append({"role": "user", "content": prompt})
+    
+    return _make_openrouter_request(
+        messages=messages,
+        model_name=model_name,
+        temperature=temperature,
     )
-    return response.text.strip()
 
 
 def generate_chat_completion(
-    contents: List[types.Content],
+    messages: List[Dict[str, str]],
     system_instruction: str | None = None,
     model_name: str | None = None,
     temperature: float = 0.0,
 ) -> str:
-    """Multi-turn chat completion using typed Content objects."""
-    client = _get_client()
-    target_model = model_name or MODEL_NAME
-    prepend_instruction = None
+    """Multi-turn chat completion."""
+    full_messages = []
     
-    config_kwargs = {"temperature": temperature}
     if system_instruction:
-        if _supports_system_instruction(target_model):
-            config_kwargs["system_instruction"] = system_instruction
-        else:
-            prepend_instruction = system_instruction
-
-    config = types.GenerateContentConfig(**config_kwargs)
-
-    if prepend_instruction:
-        contents = [
-            types.Content(
-                role="user",
-                parts=[types.Part(text=prepend_instruction)],
-            )
-        ] + contents
-
-    response = client.models.generate_content(
-        model=target_model,
-        contents=contents,
-        config=config,
+        full_messages.append({"role": "system", "content": system_instruction})
+    
+    full_messages.extend(messages)
+    
+    return _make_openrouter_request(
+        messages=full_messages,
+        model_name=model_name,
+        temperature=temperature,
     )
-    return response.text.strip()
 
 
 def parse_agent_response(response: str) -> dict:
@@ -213,20 +248,34 @@ def query_generate_agent(question: str) -> str:
         'form {"query": <query>, "context": <context>} describing the retrieval you need.'
     )
 
-    contents = [
-        types.Content(
-            role="user",
-            parts=[types.Part(text=f"Given Question: {question}")],
-        ),
+    messages = [
+        {"role": "user", "content": f"Given Question: {question}"},
     ]
 
     response = generate_chat_completion(
-        contents=contents,
+        messages=messages,
         system_instruction=system_prompt,
     )
     parsed_response = parse_agent_response(response)
     return parsed_response.get("query", "")
 
+
+def validator_agent(question: str, answer: str) -> str:
+    system_prompt = (
+        "You are a validator agent who validates the answer of the question. "
+        "Identify whether the given answer is correct or not and return true or false "
+        'in the form of JSON: {"answer": true} or {"answer": false}.'
+    )
+    messages = [
+        {"role": "user", "content": f"Question: {question}\nAnswer: {answer}"},
+    ]
+    response = generate_chat_completion(
+        messages=messages,
+        system_instruction=system_prompt,
+    )
+    parsed_response = parse_agent_response(response)
+    print("validator_response: ", parsed_response)
+    return parsed_response.get("answer", "")
 
 
 def search_agent(question: str, chunks: List[dict]):
@@ -248,24 +297,26 @@ def search_agent(question: str, chunks: List[dict]):
         "If you think there is no valid answer to question, "
         'return the answer in the form of JSON: {"found": false, "answer": ""}.'
     )
-    contents = [
-        types.Content(
-            role="user",
-            parts=[types.Part(text=f"Context: {chunks if chunks else ''} Question: {question}")],
-        ),
+    
+    messages = [
+        {"role": "user", "content": f"Context: {chunks if chunks else ''} Question: {question}"},
     ]
-    print("calling gemini request ")
+    print("calling OpenRouter request (DeepSeek R1)")
 
     response = generate_chat_completion(
-        contents=contents,
+        messages=messages,
         system_instruction=system_prompt,
     )
 
     print("response: ", response)
 
-
     parsed_response = parse_agent_response(response)
     print("parsed_response: ", parsed_response)
+    
+    if parsed_response.get("found") == True:
+        answer = validator_agent(question, parsed_response.get("answer"))
+        print("answer: ", answer)
+
     if parsed_response.get("tool") == "RAGTool":
         
         args = parsed_response.get("args")
@@ -273,6 +324,7 @@ def search_agent(question: str, chunks: List[dict]):
         if args:
             print("calling RAGTool")
             chunk = rag_tool(args["query"], args["k"])
+
             return search_agent(question, chunk) 
         else:
             print("no args found")
@@ -280,13 +332,9 @@ def search_agent(question: str, chunks: List[dict]):
     return parsed_response
 
 
-
-
-
 if __name__ == "__main__":
     # Example: Retrieve top 3 chunks for a query
     dataset = load_dataset("dataset.json")
-    import time
     question = dataset[0]["question"]
 
     global embedder, index, metadata
@@ -297,7 +345,6 @@ if __name__ == "__main__":
     metadata = load_metadata("conversation_metadata.json")
     
     # Perform similarity search
-    # chunks = retrieve_top_k_chunks(query, embedder, index, metadata, k=3)
-
     answer = search_agent(question, None)
     print(answer)
+
