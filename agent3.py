@@ -273,6 +273,30 @@ def query_generate_agent(question: str) -> str:
 
 
 
+
+def remember_agent(question: str) -> str:
+    system_prompt = (
+        "You are a memory remember agent, you are responsible for saving the particular details for the conversation in the vector db",
+        "First understand the text and think weather it is worth rembering the details in the vector db",
+        "Ask yourself, is there any details available in the text that is worth remembering?",
+        "If yes, then save the details in the vector db",
+        "If no, no need to save the details in the vector db",
+        "Return the answer in the form of JSON: {'remember': true/false}"
+    )
+
+    messages = [
+        {"role": "user", "content": f"Given Question: {question}"},
+    ]
+    response = generate_chat_completion(
+        messages=messages,
+        system_instruction=system_prompt,
+    )
+    parsed_response = parse_agent_response(response)
+    return parsed_response.get("remember", "")
+
+
+
+
 def search_agent(question: str, chunks: List[dict]):
 
     rag_tool = RAGTool(name="RAGTool", description="Retrieve information from the RAG index.", parameters={"query": str, "k": int})
@@ -346,6 +370,7 @@ Respond with JSON only:"""
             print("no args found")
 
     return parsed_response
+
 
 
 if __name__ == "__main__":
