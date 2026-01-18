@@ -136,10 +136,22 @@ def _make_openrouter_request(
     message = result["choices"][0]["message"]
     content = message.get("content", "").strip()
     
-    # Optionally log reasoning if present
+    # Check reasoning_details if content is empty (model put answer in reasoning)
     reasoning_details = message.get("reasoning_details")
     if reasoning_details:
-        print(f"[Reasoning]: {reasoning_details[:500]}..." if len(str(reasoning_details)) > 500 else f"[Reasoning]: {reasoning_details}")
+        reasoning_text = ""
+        if isinstance(reasoning_details, list):
+            for item in reasoning_details:
+                if isinstance(item, dict) and "text" in item:
+                    reasoning_text += item["text"]
+        elif isinstance(reasoning_details, str):
+            reasoning_text = reasoning_details
+        
+        print(f"[Reasoning]: {reasoning_text[:500]}..." if len(reasoning_text) > 500 else f"[Reasoning]: {reasoning_text}")
+        
+        # If content is empty, try to extract JSON from reasoning
+        if not content and reasoning_text:
+            content = reasoning_text
     
     return content
 
@@ -261,13 +273,18 @@ def query_generate_agent(question: str) -> str:
 
 
 def validator_agent(question: str, answer: str) -> str:
-    system_prompt = (
-        "You are a validator agent who validates the answer of the question. "
-        "Identify whether the given answer is correct or not and return true or false "
-        'in the form of JSON: {"answer": true} or {"answer": false}.'
-    )
+    system_prompt = """You validate if an answer correctly addresses a question.
+
+IMPORTANT: Respond with ONLY valid JSON. No explanations.
+
+Response format:
+{"valid": true} - if the answer correctly addresses the question
+{"valid": false} - if the answer is wrong, incomplete, or doesn't address the question
+
+Output ONLY the JSON object, nothing else."""
+
     messages = [
-        {"role": "user", "content": f"Question: {question}\nAnswer: {answer}"},
+        {"role": "user", "content": f"Question: {question}\nProposed Answer: {answer}\n\nRespond with JSON only:"},
     ]
     response = generate_chat_completion(
         messages=messages,
@@ -282,26 +299,50 @@ def search_agent(question: str, chunks: List[dict]):
 
     rag_tool = RAGTool(name="RAGTool", description="Retrieve information from the RAG index.", parameters={"query": str, "k": int})
 
-    system_prompt = (
-        "You are a search agent who searches the answer to the question from the conversation. "
-        "Given a question like 'What did I order last night at the <restaurant_name> restaurant?', "
-        "You have the following tools to use: RAGTool. "
-        "RAGTool is a tool that can be used to retrieve information from the RAG index. "
-        "RAGTool takes a query and a number of chunks to retrieve. "
-        "RAGTool returns a list of chunks that are similar to the query. "
-        "You have to crawl the conversation to find the answer to the question. "
-        "Think step by step and reason about the question and the context to find the answer using the RAGTool. "
-        "To call the RAGTool, you need to use the following JSON format: {'tool': 'RAGTool', 'args': {'query': <query>, 'k': <k>}}. "
-        "You have to find the answer in the conversation. "
-        'Return the answer in the form of JSON: {"found": true, "answer": <answer>}. '
-        "If you think there is no valid answer to question, "
-        'return the answer in the form of JSON: {"found": false, "answer": ""}.'
-    )
+    system_prompt = """You are a search agent. Your task is to find answers in conversation history using RAGTool.
+
+IMPORTANT: You must respond with ONLY valid JSON. No explanations, no markdown, no extra text.
+
+Available tool:
+- RAGTool: Searches conversation history. Args: query (string), k (number of results)
+
+Response format (choose ONE):
+
+1. To search for more context:
+{"tool": "RAGTool", "args": {"query": "your search query", "k": 5}}
+
+2. When you found the answer:
+{"found": true, "answer": "the specific answer"}
+
+3. When answer cannot be found:
+{"found": false, "answer": ""}
+
+Rules:
+- Output ONLY the JSON object, nothing else
+- If context is empty or insufficient, use RAGTool to search
+- Extract specific answers, not summaries
+- Do not wrap JSON in markdown code blocks"""
+    
+    # Format context clearly
+    if chunks:
+        context_str = "\n".join([
+            f"[Chunk {c.get('rank', i+1)}]: {c.get('text', c.get('content', str(c)))}"
+            for i, c in enumerate(chunks[:5])  # Limit to top 5 chunks
+        ])
+    else:
+        context_str = "No context provided. Use RAGTool to search."
+    
+    user_content = f"""Context:
+{context_str}
+
+Question: {question}
+
+Respond with JSON only:"""
     
     messages = [
-        {"role": "user", "content": f"Context: {chunks if chunks else ''} Question: {question}"},
+        {"role": "user", "content": user_content},
     ]
-    print("calling OpenRouter request (DeepSeek R1)")
+    print("calling OpenRouter request")
 
     response = generate_chat_completion(
         messages=messages,
@@ -335,7 +376,7 @@ def search_agent(question: str, chunks: List[dict]):
 if __name__ == "__main__":
     # Example: Retrieve top 3 chunks for a query
     dataset = load_dataset("dataset.json")
-    question = dataset[0]["question"]
+    question = dataset[2]["question"]
 
     global embedder, index, metadata
     
