@@ -272,28 +272,6 @@ def query_generate_agent(question: str) -> str:
     return parsed_response.get("query", "")
 
 
-def validator_agent(question: str, answer: str) -> str:
-    system_prompt = """You validate if an answer correctly addresses a question.
-
-IMPORTANT: Respond with ONLY valid JSON. No explanations.
-
-Response format:
-{"valid": true} - if the answer correctly addresses the question
-{"valid": false} - if the answer is wrong, incomplete, or doesn't address the question
-
-Output ONLY the JSON object, nothing else."""
-
-    messages = [
-        {"role": "user", "content": f"Question: {question}\nProposed Answer: {answer}\n\nRespond with JSON only:"},
-    ]
-    response = generate_chat_completion(
-        messages=messages,
-        system_instruction=system_prompt,
-    )
-    parsed_response = parse_agent_response(response)
-    print("validator_response: ", parsed_response)
-    return parsed_response.get("answer", "")
-
 
 def search_agent(question: str, chunks: List[dict]):
 
@@ -353,10 +331,7 @@ Respond with JSON only:"""
 
     parsed_response = parse_agent_response(response)
     print("parsed_response: ", parsed_response)
-    
-    if parsed_response.get("found") == True:
-        answer = validator_agent(question, parsed_response.get("answer"))
-        print("answer: ", answer)
+
 
     if parsed_response.get("tool") == "RAGTool":
         
