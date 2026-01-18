@@ -349,18 +349,19 @@ Respond with JSON only:"""
 
 
 if __name__ == "__main__":
-    # Example: Retrieve top 3 chunks for a query
+    # Load resources once and reuse them for every question
     dataset = load_dataset("dataset.json")
-    question = dataset[2]["question"]
 
     global embedder, index, metadata
-    
-    # Load required components
     embedder = load_embedder("sentence-transformers/all-MiniLM-L6-v2")
     index = load_faiss_index("conversation.index")
     metadata = load_metadata("conversation_metadata.json")
-    
-    # Perform similarity search
-    answer = search_agent(question, None)
-    print(answer)
 
+    answers: List[Dict[str, Any]] = []
+    for item in dataset:
+        question = item["question"]
+        answer = search_agent(question, None)
+        answers.append({"question": question, "answer": answer})
+
+    with open("answer.json", "w") as f:
+        json.dump(answers, f, indent=4)
